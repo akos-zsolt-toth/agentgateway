@@ -1225,3 +1225,214 @@ fn test_embeddings_error_translation() {
 	assert_eq!(error_resp["error"]["type"], "invalid_request_error");
 	assert_eq!(error_resp["error"]["message"], "Model not found");
 }
+
+#[test]
+fn test_completions_consecutive_tool_messages_are_merged_into_single_user_message() {
+	let provider = Provider {
+		model: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+	};
+
+	let req = types::completions::typed::Request {
+		model: Some("anthropic.claude-3-sonnet".to_string()),
+		messages: vec![
+			types::completions::typed::RequestMessage::User(
+				types::completions::typed::RequestUserMessage {
+					content: types::completions::typed::RequestUserMessageContent::Text(
+						"Search for both terms".to_string(),
+					),
+					name: None,
+				},
+			),
+			types::completions::typed::RequestMessage::Assistant(
+				types::completions::typed::RequestAssistantMessage {
+					content: None,
+					name: None,
+					refusal: None,
+					tool_calls: Some(vec![
+						types::completions::typed::MessageToolCalls::Function(
+							types::completions::typed::MessageToolCall {
+								id: "call_1".to_string(),
+								function: types::completions::typed::FunctionCall {
+									name: "grep".to_string(),
+									arguments: r#"{"q":"foo"}"#.to_string(),
+								},
+							},
+						),
+						types::completions::typed::MessageToolCalls::Function(
+							types::completions::typed::MessageToolCall {
+								id: "call_2".to_string(),
+								function: types::completions::typed::FunctionCall {
+									name: "grep".to_string(),
+									arguments: r#"{"q":"bar"}"#.to_string(),
+								},
+							},
+						),
+					]),
+					audio: None,
+					#[allow(deprecated)]
+					function_call: None,
+				},
+			),
+			types::completions::typed::RequestMessage::Tool(
+				types::completions::typed::RequestToolMessage {
+					content: types::completions::typed::RequestToolMessageContent::Text(
+						"found foo".to_string(),
+					),
+					tool_call_id: "call_1".to_string(),
+				},
+			),
+			types::completions::typed::RequestMessage::Tool(
+				types::completions::typed::RequestToolMessage {
+					content: types::completions::typed::RequestToolMessageContent::Text(
+						"found bar".to_string(),
+					),
+					tool_call_id: "call_2".to_string(),
+				},
+			),
+		],
+		stream: None,
+		temperature: None,
+		top_p: None,
+		max_completion_tokens: Some(1024),
+		stop: None,
+		tools: None,
+		tool_choice: None,
+		parallel_tool_calls: None,
+		user: None,
+		vendor_extensions: Default::default(),
+		frequency_penalty: None,
+		logit_bias: None,
+		logprobs: None,
+		top_logprobs: None,
+		n: None,
+		modalities: None,
+		prediction: None,
+		audio: None,
+		presence_penalty: None,
+		response_format: None,
+		seed: None,
+		#[allow(deprecated)]
+		function_call: None,
+		#[allow(deprecated)]
+		functions: None,
+		metadata: None,
+		#[allow(deprecated)]
+		max_tokens: None,
+		service_tier: None,
+		web_search_options: None,
+		stream_options: None,
+		store: None,
+		reasoning_effort: None,
+	};
+
+	let out = super::from_completions::translate_internal(
+		req,
+		"anthropic.claude-3-sonnet".to_string(),
+		&provider,
+		None,
+		None,
+	);
+
+	// User + Assistant + User (merged tool results) = 3 messages
+	assert_eq!(
+		out.messages.len(),
+		3,
+		"consecutive tool messages should be merged"
+	);
+	assert_eq!(out.messages[0].role, types::bedrock::Role::User);
+	assert_eq!(out.messages[1].role, types::bedrock::Role::Assistant);
+	assert_eq!(out.messages[2].role, types::bedrock::Role::User);
+
+	// The merged user message should contain both tool results
+	assert_eq!(
+		out.messages[2].content.len(),
+		2,
+		"merged message should have 2 tool result blocks"
+	);
+	assert!(
+		matches!(&out.messages[2].content[0], types::bedrock::ContentBlock::ToolResult(r) if r.tool_use_id == "call_1")
+	);
+	assert!(
+		matches!(&out.messages[2].content[1], types::bedrock::ContentBlock::ToolResult(r) if r.tool_use_id == "call_2")
+	);
+}
+
+#[test]
+fn test_responses_consecutive_function_call_outputs_are_merged_into_single_user_message() {
+	let provider = Provider {
+		model: None,
+		region: strng::new("us-east-1"),
+		guardrail_identifier: None,
+		guardrail_version: None,
+	};
+
+	// Parallel function calls followed by their outputs: the calls produce
+	// consecutive Assistant messages and the outputs produce consecutive User
+	// messages. Without coalescing, Bedrock would reject both pairs.
+	let req: types::responses::Request = serde_json::from_value(json!({
+		"model": "anthropic.claude-3-sonnet",
+		"max_output_tokens": 1024,
+		"input": [
+			{
+				"type": "message",
+				"role": "user",
+				"content": [{"type": "input_text", "text": "What is the weather in New York and London?"}]
+			},
+			{
+				"type": "function_call",
+				"call_id": "call_1",
+				"name": "get_weather",
+				"arguments": "{\"location\":\"New York\"}"
+			},
+			{
+				"type": "function_call",
+				"call_id": "call_2",
+				"name": "get_weather",
+				"arguments": "{\"location\":\"London\"}"
+			},
+			{
+				"type": "function_call_output",
+				"call_id": "call_1",
+				"output": "Sunny and 72F"
+			},
+			{
+				"type": "function_call_output",
+				"call_id": "call_2",
+				"output": "Cloudy and 58F"
+			}
+		]
+	}))
+	.expect("valid responses request");
+
+	let translated = super::from_responses::translate(&req, &provider, None, None).unwrap();
+	let bedrock_req: serde_json::Value = serde_json::from_slice(&translated).unwrap();
+
+	let messages = bedrock_req["messages"]
+		.as_array()
+		.expect("messages should be an array");
+
+	// User + Assistant(call_1 + call_2 merged) + User(result_1 + result_2 merged) = 3
+	assert_eq!(
+		messages.len(),
+		3,
+		"consecutive same-role messages should be merged"
+	);
+	assert_eq!(messages[0]["role"], "user");
+	assert_eq!(messages[1]["role"], "assistant");
+	assert_eq!(messages[2]["role"], "user");
+
+	// The merged assistant message should contain both tool use blocks
+	let asst_content = messages[1]["content"].as_array().unwrap();
+	assert_eq!(asst_content.len(), 2);
+	assert_eq!(asst_content[0]["toolUse"]["toolUseId"], "call_1");
+	assert_eq!(asst_content[1]["toolUse"]["toolUseId"], "call_2");
+
+	// The merged user message should contain both tool result blocks
+	let user_content = messages[2]["content"].as_array().unwrap();
+	assert_eq!(user_content.len(), 2);
+	assert_eq!(user_content[0]["toolResult"]["toolUseId"], "call_1");
+	assert_eq!(user_content[1]["toolResult"]["toolUseId"], "call_2");
+}

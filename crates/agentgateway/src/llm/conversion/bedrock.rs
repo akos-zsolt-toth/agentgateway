@@ -394,6 +394,7 @@ pub mod from_completions {
 					}),
 			})
 			.collect();
+		let messages = helpers::coalesce_consecutive_messages(messages);
 
 		let inference_config = bedrock::InferenceConfiguration {
 			max_tokens: req.max_tokens(),
@@ -1837,6 +1838,7 @@ pub mod from_responses {
 				},
 			}
 		}
+		let messages = helpers::coalesce_consecutive_messages(messages);
 
 		let mut system_content = if system_blocks.is_empty() {
 			None
@@ -2645,6 +2647,24 @@ mod helpers {
 		let timestamp = chrono::Utc::now().timestamp_millis();
 		let random: u32 = rand::random();
 		format!("msg_{:x}{:08x}", timestamp, random)
+	}
+
+	/// Merge consecutive messages with the same role into a single message.
+	/// Bedrock's Converse API requires strict user/assistant alternation;
+	/// this handles the OpenAI convention where each parallel tool result
+	/// is a separate `tool` role message (all mapped to Bedrock `User`).
+	pub fn coalesce_consecutive_messages(messages: Vec<bedrock::Message>) -> Vec<bedrock::Message> {
+		let mut result: Vec<bedrock::Message> = Vec::with_capacity(messages.len());
+		for msg in messages {
+			if let Some(last) = result.last_mut()
+				&& last.role == msg.role
+			{
+				last.content.extend(msg.content);
+			} else {
+				result.push(msg);
+			}
+		}
+		result
 	}
 }
 
